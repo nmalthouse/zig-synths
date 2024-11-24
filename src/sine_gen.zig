@@ -7,12 +7,18 @@ const c = @cImport({
 });
 const Os9Gui = graph.gui_app.Os9Gui;
 
+fn ms(s: f32) f32 {
+    return s / 1000;
+}
+
 var param_mutex = std.Thread.Mutex{};
 const Param = struct {
     spread: f32 = 0,
     phase: f32 = 0,
     freq: f32 = 440,
     amp: f32 = 0.2,
+
+    m_adsr: Envelope = .{},
 };
 var params: Param = .{};
 pub const Userdata = struct {
@@ -21,25 +27,73 @@ pub const Userdata = struct {
     midi_in: *c.jack_port_t,
     output_port: *c.jack_port_t,
     sample_rate: usize,
-    modfr: f32 = 1,
-    modt: f32 = 0,
-    t: f32 = 0,
 
-    nvoice: usize = 16,
     spread: f32 = 0,
 
-    voices: [16]Voice = [_]Voice{.{ .freq = 440, .amp = 0.5 }} ** 16,
+    oscs: [16]Osc = [_]Osc{.{}} ** 16,
+};
 
-    v1: Voice = .{ .freq = 440, .amp = 0.5 },
+//Linear adsr
+pub const Envelope = struct {
+    pub const State = enum {
+        attack,
+        decay,
+        sustain,
+        release,
+        off,
+    };
+    a: f32 = ms(10),
+    d: f32 = ms(1),
+    s: f32 = 1,
+    r: f32 = ms(1),
 
-    oscs: [4]Osc = [_]Osc{.{}} ** 4,
+    state: State = .off,
+    t: f32 = 0,
+
+    pub fn trigger(self: *@This()) void {
+        self.t = 0;
+        self.state = .attack;
+    }
+
+    pub fn untrigger(self: *@This()) void {
+        self.state = .release;
+        self.t = 0;
+    }
+
+    pub fn tryAdv(self: *@This(), current: f32, next: State) void {
+        if (self.t > current) {
+            self.t = 0;
+            self.state = next;
+        }
+    }
+
+    pub fn getAmp(self: *@This(), dt: f32) f32 {
+        switch (self.state) {
+            .attack => self.tryAdv(self.a, .decay),
+            .decay => self.tryAdv(self.d, .sustain),
+            .sustain => {},
+            .release => self.tryAdv(self.r, .off),
+            .off => return 0,
+        }
+        const val = switch (self.state) {
+            .off => return 0,
+            .attack => self.t / self.a,
+            .decay => self.t * (self.s - 1) / self.d + 1,
+            .sustain => self.s,
+            .release => -self.s * self.t / self.r + self.s,
+        };
+
+        self.t += dt;
+        return val;
+    }
 };
 
 pub const Osc = struct {
     note: u8 = 0,
     pitch: f32 = 1,
     voice: Voice = .{},
-    active: bool = false,
+
+    adsr: Envelope = .{},
 };
 
 pub const Voice = struct {
@@ -58,9 +112,27 @@ pub const Voice = struct {
     }
 };
 
+fn sin(th: f32) f32 {
+    return @sin(th);
+}
+
 fn saw(theta: f32) f32 {
     const th = @mod(theta, std.math.tau) - std.math.pi;
     return th / std.math.pi;
+}
+
+fn square(theta: f32) f32 {
+    const th = @mod(theta, std.math.tau);
+    if (th > std.math.pi)
+        return 0;
+    return 1;
+}
+
+fn squareDC(theta: f32, duty: f32) f32 {
+    const th = @mod(theta, std.math.tau);
+    if (th > std.math.tau * duty)
+        return 0;
+    return 1;
 }
 
 //fn square
@@ -84,12 +156,11 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
 
     if (param_mutex.tryLock()) {
         defer param_mutex.unlock();
-        for (&ud.voices, 0..) |*v, i| {
-            const fi = @as(f32, @floatFromInt(i));
-            //v.phase = fi * params.phase;
-
-            v.freq = params.freq + fi * params.spread;
-            v.amp = params.amp;
+        for (&ud.oscs) |*osc| {
+            osc.adsr.a = params.m_adsr.a;
+            osc.adsr.d = params.m_adsr.d;
+            osc.adsr.s = params.m_adsr.s;
+            osc.adsr.r = params.m_adsr.r;
         }
     }
 
@@ -109,14 +180,14 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
                         .note_off => {
                             for (&ud.oscs) |*osc| {
                                 if (osc.note == me.buffer[1]) {
-                                    osc.active = false;
+                                    osc.adsr.untrigger();
                                 }
                             }
                         },
                         .note_on => {
                             for (&ud.oscs) |*osc| {
-                                if (!osc.active) {
-                                    osc.active = true;
+                                if (osc.adsr.state == .off) {
+                                    osc.adsr.trigger();
                                     osc.note = me.buffer[1];
                                     osc.pitch = 440.0 * std.math.pow(f32, 2, (@as(f32, @floatFromInt(osc.note)) - 69) / 12);
                                     osc.voice.freq = osc.pitch;
@@ -138,8 +209,8 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
         var out: f32 = 0;
         var num_active: f32 = 0.001;
         for (&ud.oscs) |*osc| {
-            if (osc.active) {
-                out += osc.voice.getSample(dt);
+            if (osc.adsr.state != .off) {
+                out += osc.voice.getSample(dt) * osc.adsr.getAmp(dt);
                 num_active += 1;
             }
         }
@@ -162,8 +233,8 @@ pub fn main() !void {
     const alloc = gpa.allocator();
     const client_name = "sinegen";
 
-    var xosh = std.rand.DefaultPrng.init(0);
-    const rand = xosh.random();
+    //var xosh = std.rand.DefaultPrng.init(0);
+    //const rand = xosh.random();
     //const system_in_regex = "PCM.*capture_FR";
 
     var status: c.jack_status_t = undefined;
@@ -181,13 +252,6 @@ pub fn main() !void {
         .output_port = c.jack_port_register(client, "output", c.JACK_DEFAULT_AUDIO_TYPE, c.JackPortIsOutput, 0) orelse return,
         .sample_rate = c.jack_get_sample_rate(client),
     };
-    for (&userdata.voices, 0..) |*v, i| {
-        const fi = @as(f32, @floatFromInt(i));
-        v.phase = rand.float(f32);
-        //v.phase = fi * 20.0 / 1000;
-
-        v.freq += fi * 0;
-    }
     _ = c.jack_set_process_callback(client, process, &userdata);
 
     _ = c.jack_connect(client, c.jack_port_name(userdata.output_port), "REAPER:in1");
@@ -195,7 +259,7 @@ pub fn main() !void {
 
     _ = c.jack_activate(client);
 
-    const do_gui = false;
+    const do_gui = true;
     if (do_gui) {
         var win = try graph.SDL.Window.createWindow("zig-game-engine", .{});
         defer win.destroyWindow();
@@ -234,6 +298,11 @@ pub fn main() !void {
                     os9gui.sliderEx(&params.phase, 0, 10, "phase {d:.2}", .{params.phase});
                     os9gui.sliderEx(&params.freq, 100, 440, "freq {d:.2}", .{params.freq});
                     os9gui.sliderEx(&params.amp, 0, 0.5, "amp {d:.2}", .{params.amp});
+
+                    os9gui.sliderEx(&params.m_adsr.a, 0, 0.5, "att {d:.2}", .{params.m_adsr.a * 1000});
+                    os9gui.sliderEx(&params.m_adsr.d, 0, 0.5, "dec {d:.2}", .{params.m_adsr.d * 1000});
+                    os9gui.sliderEx(&params.m_adsr.s, 0, 1, "sus {d:.2}", .{params.m_adsr.s});
+                    os9gui.sliderEx(&params.m_adsr.r, 0, 0.5, "rel {d:.2}", .{params.m_adsr.r * 1000});
                 }
             }
             try os9gui.endFrame(&draw);
