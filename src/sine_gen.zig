@@ -6,6 +6,7 @@ const c = @cImport({
     @cInclude("fftw3.h");
 });
 const Os9Gui = graph.gui_app.Os9Gui;
+const NUM_OSC = 32;
 
 fn ms(s: f32) f32 {
     return s / 1000;
@@ -17,8 +18,11 @@ const Param = struct {
     phase: f32 = 0,
     freq: f32 = 440,
     amp: f32 = 0.2,
+    fc: f32 = 5000,
 
     m_adsr: Envelope = .{},
+
+    wave1: Osc.Waveform = .w_saw,
 };
 var params: Param = .{};
 pub const Userdata = struct {
@@ -26,11 +30,16 @@ pub const Userdata = struct {
 
     midi_in: *c.jack_port_t,
     output_port: *c.jack_port_t,
+    debug_port: *c.jack_port_t,
     sample_rate: usize,
+    amp: f32 = 0,
+    fc: f32 = 0,
 
     spread: f32 = 0,
 
-    oscs: [16]Osc = [_]Osc{.{}} ** 16,
+    oscs: [NUM_OSC]Osc = [_]Osc{.{}} ** NUM_OSC,
+
+    prev: f32 = 0,
 };
 
 //Linear adsr
@@ -45,7 +54,7 @@ pub const Envelope = struct {
     a: f32 = ms(10),
     d: f32 = ms(1),
     s: f32 = 1,
-    r: f32 = ms(1),
+    r: f32 = ms(50),
 
     state: State = .off,
     t: f32 = 0,
@@ -56,6 +65,8 @@ pub const Envelope = struct {
     }
 
     pub fn untrigger(self: *@This()) void {
+        if (self.state == .release or self.state == .off)
+            return;
         self.state = .release;
         self.t = 0;
     }
@@ -89,9 +100,27 @@ pub const Envelope = struct {
 };
 
 pub const Osc = struct {
+    const num_voice = 3;
+    pub const Waveform = enum(u8) {
+        w_sin,
+        w_saw,
+        w_square,
+
+        pub fn fun(self: @This(), th: f32) f32 {
+            return switch (self) {
+                .w_sin => sin(th),
+                .w_saw => saw(th),
+                .w_square => square(th),
+            };
+        }
+    };
+
+    vel: f32 = 1,
     note: u8 = 0,
     pitch: f32 = 1,
-    voice: Voice = .{},
+
+    voices: [num_voice]Voice = [_]Voice{.{}} ** num_voice,
+    wave: Waveform = .w_saw,
 
     adsr: Envelope = .{},
 };
@@ -99,11 +128,10 @@ pub const Osc = struct {
 pub const Voice = struct {
     freq: f32 = 1,
     t: f32 = 0,
-    amp: f32 = 0.5,
     phase: f32 = 0,
 
-    pub fn getSample(vo: *@This(), dt: f32) f32 {
-        const out = vo.amp * saw(std.math.tau * vo.freq * vo.t + vo.phase);
+    pub fn getSample(vo: *@This(), dt: f32, wave: Osc.Waveform) f32 {
+        const out = wave.fun(std.math.tau * vo.freq * vo.t + vo.phase);
         vo.t += dt;
 
         if (vo.t > 1.0 / vo.freq)
@@ -123,15 +151,15 @@ fn saw(theta: f32) f32 {
 
 fn square(theta: f32) f32 {
     const th = @mod(theta, std.math.tau);
-    if (th > std.math.pi)
-        return 0;
+    if (th >= std.math.pi)
+        return -1;
     return 1;
 }
 
 fn squareDC(theta: f32, duty: f32) f32 {
     const th = @mod(theta, std.math.tau);
     if (th > std.math.tau * duty)
-        return 0;
+        return -1;
     return 1;
 }
 
@@ -150,19 +178,26 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
     midi_index += 1;
 
     const outbuf: [*c]f32 = @ptrCast(@alignCast(c.jack_port_get_buffer(ud.output_port, nframes).?));
+    const dbgbuf: [*c]f32 = @ptrCast(@alignCast(c.jack_port_get_buffer(ud.debug_port, nframes).?));
 
     const sr: f32 = @floatFromInt(ud.sample_rate);
     const dt = 1.0 / sr;
 
     if (param_mutex.tryLock()) {
         defer param_mutex.unlock();
+        ud.spread = params.spread;
+        ud.fc = params.fc;
+        ud.amp = params.amp;
         for (&ud.oscs) |*osc| {
+            osc.wave = params.wave1;
             osc.adsr.a = params.m_adsr.a;
             osc.adsr.d = params.m_adsr.d;
             osc.adsr.s = params.m_adsr.s;
             osc.adsr.r = params.m_adsr.r;
         }
     }
+
+    const alpha = std.math.tau * dt * ud.fc / (std.math.tau * dt * ud.fc + 1);
 
     for (0..nframes) |si| {
         while (mid_event != null and mid_event.?.time >= si) {
@@ -189,8 +224,13 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
                                 if (osc.adsr.state == .off) {
                                     osc.adsr.trigger();
                                     osc.note = me.buffer[1];
+                                    osc.vel = 128.0 / @as(f32, @floatFromInt(me.buffer[2]));
                                     osc.pitch = 440.0 * std.math.pow(f32, 2, (@as(f32, @floatFromInt(osc.note)) - 69) / 12);
-                                    osc.voice.freq = osc.pitch;
+                                    for (&osc.voices, 0..) |*v, i| {
+                                        //v.freq = osc.pitch + spread * @as(f32, @floatFromInt(i)) * (440 / osc.pitch);
+
+                                        v.freq = osc.pitch * (1 + @as(f32, @floatFromInt(i)) * ud.spread);
+                                    }
                                     break;
                                 }
                             }
@@ -207,22 +247,26 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
             midi_index += 1;
         }
         var out: f32 = 0;
-        var num_active: f32 = 0.001;
         for (&ud.oscs) |*osc| {
             if (osc.adsr.state != .off) {
-                out += osc.voice.getSample(dt) * osc.adsr.getAmp(dt);
-                num_active += 1;
+                const amp = osc.adsr.getAmp(dt) * osc.vel;
+                var va: f32 = 0;
+                for (&osc.voices) |*v| {
+                    va += v.getSample(dt, osc.wave);
+                }
+
+                out += amp * va / osc.voices.len;
+                //out = out / osc.voices.len;
             }
         }
-        outbuf[si] = out / num_active;
-        //for (&ud.voices) |*vo| {
-        //    out += vo.amp * saw(std.math.tau * vo.freq * vo.t + vo.phase);
-        //    vo.t += dt;
+        out *= ud.amp;
+        //alpha = tau *dt * fc / (tau dt fc + 1)
+        //y[i] = y[i-1] + alpha * (out - y[i-1])
+        dbgbuf[si] = out;
+        outbuf[si] = (ud.prev + alpha * (out - ud.prev));
 
-        //    if (vo.t > 1.0 / vo.freq)
-        //        vo.t = @mod(vo.t, 1.0 / vo.freq);
-        //}
-        //outbuf[si] = out / @as(f32, @floatFromInt(ud.voices.len));
+        //outbuf[si] = beta * ud.prev + (1 - beta) * out;
+        ud.prev = outbuf[si];
     }
 
     return 0;
@@ -247,14 +291,25 @@ pub fn main() !void {
         std.debug.print("client can't work\n", .{});
     }
 
+    blk: {
+        const inf = std.fs.cwd().openFile("params.json", .{}) catch break :blk;
+        const sl = try inf.reader().readAllAlloc(alloc, std.math.maxInt(usize));
+        defer alloc.free(sl);
+        const parsed = try std.json.parseFromSlice(Param, alloc, sl, .{});
+        params = parsed.value;
+        parsed.deinit();
+    }
+
     var userdata = Userdata{
         .midi_in = c.jack_port_register(client, "mid_in", c.JACK_DEFAULT_MIDI_TYPE, c.JackPortIsInput, 0) orelse return,
         .output_port = c.jack_port_register(client, "output", c.JACK_DEFAULT_AUDIO_TYPE, c.JackPortIsOutput, 0) orelse return,
+        .debug_port = c.jack_port_register(client, "debug", c.JACK_DEFAULT_AUDIO_TYPE, c.JackPortIsOutput, 0) orelse return,
         .sample_rate = c.jack_get_sample_rate(client),
     };
     _ = c.jack_set_process_callback(client, process, &userdata);
 
     _ = c.jack_connect(client, c.jack_port_name(userdata.output_port), "REAPER:in1");
+    _ = c.jack_connect(client, c.jack_port_name(userdata.debug_port), "REAPER:in2");
     _ = c.jack_connect(client, "REAPER:MIDI Output 3", c.jack_port_name(userdata.midi_in));
 
     _ = c.jack_activate(client);
@@ -292,17 +347,17 @@ pub fn main() !void {
                 {
                     param_mutex.lock();
                     defer param_mutex.unlock();
-                    os9gui.sliderEx(&params.spread, 0, 100, "spread {d:.2}", .{params.spread});
-                    os9gui.sliderEx(&params.spread, 0, 0.5, "spread {d:.2}", .{params.spread});
-                    //os9gui.sliderEx(&params.spread, params.spread - 1, params.spread + 1, "spread {d:.2}", .{params.spread});
-                    os9gui.sliderEx(&params.phase, 0, 10, "phase {d:.2}", .{params.phase});
-                    os9gui.sliderEx(&params.freq, 100, 440, "freq {d:.2}", .{params.freq});
+                    os9gui.sliderEx(&params.spread, 0, 1, "spread {d:.2}", .{params.spread * 100});
                     os9gui.sliderEx(&params.amp, 0, 0.5, "amp {d:.2}", .{params.amp});
+                    os9gui.hr();
 
-                    os9gui.sliderEx(&params.m_adsr.a, 0, 0.5, "att {d:.2}", .{params.m_adsr.a * 1000});
-                    os9gui.sliderEx(&params.m_adsr.d, 0, 0.5, "dec {d:.2}", .{params.m_adsr.d * 1000});
-                    os9gui.sliderEx(&params.m_adsr.s, 0, 1, "sus {d:.2}", .{params.m_adsr.s});
-                    os9gui.sliderEx(&params.m_adsr.r, 0, 0.5, "rel {d:.2}", .{params.m_adsr.r * 1000});
+                    os9gui.sliderEx(&params.m_adsr.a, 0.005, 15, "att {d:.2}", .{params.m_adsr.a * 1000});
+                    os9gui.sliderEx(&params.m_adsr.d, 0.005, 15, "dec {d:.2}", .{params.m_adsr.d * 1000});
+                    os9gui.sliderEx(&params.m_adsr.s, 0.0, 1, "sus {d:.2}", .{params.m_adsr.s});
+                    os9gui.sliderEx(&params.m_adsr.r, 0.005, 15, "rel {d:.2}", .{params.m_adsr.r * 1000});
+                    os9gui.hr();
+                    os9gui.sliderEx(&params.fc, 100, 18000, "fc {d:.2}", .{params.fc});
+                    try os9gui.radio(&params.wave1);
                 }
             }
             try os9gui.endFrame(&draw);
@@ -315,5 +370,11 @@ pub fn main() !void {
         while (true) {
             _ = try stdin.reader().readByte();
         }
+    }
+
+    {
+        var outf = try std.fs.cwd().createFile("params.json", .{});
+        try std.json.stringify(params, .{}, outf.writer());
+        outf.close();
     }
 }
