@@ -45,6 +45,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const delay = b.addExecutable(.{
+        .name = "delay",
+        .link_libc = true,
+        .root_source_file = b.path("src/delay.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const ratdep = b.dependency("ratgraph", .{ .target = target, .optimize = optimize });
     const ratmod = ratdep.module("ratgraph");
     exe.root_module.addImport("graph", ratmod);
@@ -57,6 +65,10 @@ pub fn build(b: *std.Build) void {
     sine_gen.linkSystemLibrary2("jack", .{});
     sine_gen.linkSystemLibrary2("fftw3f", .{});
     b.installArtifact(sine_gen);
+
+    delay.addSystemIncludePath(.{ .cwd_relative = "/usr/lib" });
+    delay.linkSystemLibrary2("jack", .{});
+    b.installArtifact(delay);
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
