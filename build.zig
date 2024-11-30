@@ -31,5 +31,17 @@ pub fn build(b: *std.Build) void {
     addExecutable(b, target, optimize, ratmod, "zig-jack", "src/main.zig");
     addExecutable(b, target, optimize, ratmod, "sinegen", "src/sine_gen.zig");
     addExecutable(b, target, optimize, ratmod, "delay", "src/delay.zig");
-    addExecutable(b, target, optimize, ratmod, "filter", "src/filter_test.zig");
+
+    const clap_lib = b.addSharedLibrary(.{
+        .name = "filter.clap",
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/filter_test.zig"),
+    });
+    clap_lib.root_module.addImport("graph", ratmod);
+    clap_lib.addSystemIncludePath(.{ .cwd_relative = "/usr/lib" });
+    for (system_libs) |sys| {
+        clap_lib.linkSystemLibrary2(sys, .{});
+    }
+    b.installArtifact(clap_lib);
 }

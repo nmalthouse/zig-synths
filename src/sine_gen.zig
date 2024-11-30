@@ -4,6 +4,7 @@ const c = @cImport({
     @cInclude("jack/jack.h");
     @cInclude("jack/midiport.h");
     @cInclude("fftw3.h");
+    @cInclude("clap/clap.h");
 });
 const Os9Gui = graph.gui_app.Os9Gui;
 const NUM_OSC = 16;
@@ -123,7 +124,8 @@ pub const Osc = struct {
     };
 
     vel: f32 = 1,
-    note: u8 = 0,
+    noteID: i32 = 0,
+    note: i32 = 0,
     pitch: f32 = 1,
 
     voices: [num_voice]Voice = [_]Voice{.{}} ** num_voice,
@@ -176,7 +178,7 @@ fn squareDC(theta: f32, duty: f32) f32 {
 //fn square
 //fn squareduty
 
-pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
+pub export fn e_process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
     const ud: *Userdata = @ptrCast(@alignCast(arg.?));
 
     const mid_buf: [*c]u8 = @ptrCast(@alignCast(c.jack_port_get_buffer(ud.midi_in, nframes).?));
@@ -213,13 +215,6 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
             osc.filter_adsr.r = params.f_adsr.r;
         }
     }
-
-    //const alpha = std.math.tau * dt * ud.fc / (std.math.tau * dt * ud.fc + 1);
-
-    //const G = g / (g + 1);
-
-    //const w1: f32 = 200 * std.math.tau;
-    //const w2: f32 = 200 * std.math.tau;
     const R = ud.R;
     //const R = (w1 + w2) / (2 * @sqrt(w1 * w2));
 
@@ -352,7 +347,7 @@ pub fn main() !void {
         .debug_port = c.jack_port_register(client, "debug", c.JACK_DEFAULT_AUDIO_TYPE, c.JackPortIsOutput, 0) orelse return,
         .sample_rate = c.jack_get_sample_rate(client),
     };
-    _ = c.jack_set_process_callback(client, process, &userdata);
+    _ = c.jack_set_process_callback(client, e_process, &userdata);
 
     //_ = c.jack_connect(client, c.jack_port_name(userdata.output_port), "REAPER:in1");
     _ = c.jack_connect(client, c.jack_port_name(userdata.output_port), "delay:input");
