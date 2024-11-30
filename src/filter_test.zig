@@ -19,39 +19,35 @@ const Param = struct {
     lp: f32 = 0,
     hp: f32 = 0,
 
-    delay_len: usize = 48000,
-
     kind: enum {
         bp,
         lp,
         hp,
     } = .bp,
-
-    feedback: f32 = 0.5,
-    wet: f32 = 1.0,
-    dry: f32 = 1.0,
 };
 var params: Param = .{};
 
 pub const Userdata = struct {
-    const DELAY_MAX_LEN = 48000 * 4;
+    const delay_len = 48000 * 0.3;
     const fm = 5; //fm *  jack buf_size = fft_bufsize
 
-    param: Param = .{},
     input: *c.jack_port_t,
     output_port: *c.jack_port_t,
     debug_port: *c.jack_port_t,
     sample_rate: usize,
     amp: f32 = 0,
     fc: f32 = 0,
+    R: f32 = 0,
 
-    dbuf: [DELAY_MAX_LEN]f32 = [_]f32{0} ** DELAY_MAX_LEN,
+    dbuf: [delay_len]f32 = [_]f32{0} ** delay_len,
     delay_index: usize = 0,
 
-    spread: f32 = 0,
     s: [2]f32 = undefined,
 
+    spread: f32 = 0,
+
     prev: f32 = 0,
+    param: Param = .{},
 };
 
 //Linear adsr
@@ -65,26 +61,28 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
     const inbuf: [*c]f32 = @ptrCast(@alignCast(c.jack_port_get_buffer(ud.input, nframes).?));
     const outbuf: [*c]f32 = @ptrCast(@alignCast(c.jack_port_get_buffer(ud.output_port, nframes).?));
 
-    const sr: f32 = @floatFromInt(ud.sample_rate);
-    const dt = 1.0 / sr;
     if (param_mutex.tryLock()) {
         ud.param = params;
         defer param_mutex.unlock();
     }
+
+    const sr: f32 = @floatFromInt(ud.sample_rate);
+    const dt = 1.0 / sr;
     const fc = ud.param.fc;
     const g = fc * std.math.tau * dt / 2;
+    //const G = g / (g + 1);
+
+    //const w1: f32 = 200 * std.math.tau;
+    //const w2: f32 = 200 * std.math.tau;
     const R = ud.param.R;
+    //const R = (w1 + w2) / (2 * @sqrt(w1 * w2));
     const g1 = 2 * R + g;
     const d = 1 / (1 + 2 * R * g + std.math.pow(f32, g, 2));
+
     for (0..nframes) |si| {
-        //only filter
-        //We read an index earlier than write
-
-        outbuf[si] = ud.dbuf[ud.delay_index] * ud.param.wet + inbuf[si] * ud.param.dry;
-        //outbuf[si] = BP * ud.param.bp + HP * ud.param.hp + LP * ud.param.lp;
-        //ud.dbuf[ud.delay_index] = inbuf[si] + outbuf[si] * feedback;
-
-        const x = inbuf[si] + outbuf[si] * ud.param.feedback;
+        //outbuf[si] = (ud.prev + alpha * (inbuf[si] - ud.prev));
+        //ud.prev = outbuf[si];
+        const x = inbuf[si];
         const s1 = &ud.s[0];
         const s2 = &ud.s[1];
         const HP = (x - g1 * s1.* - s2.*) * d;
@@ -95,12 +93,7 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
         const LP = v2 + s2.*;
         s2.* = LP + v2;
 
-        ud.dbuf[ud.delay_index] = BP * ud.param.bp + HP * ud.param.hp + LP * ud.param.lp;
-
-        ud.delay_index = (ud.delay_index + 1) % ud.param.delay_len;
-    }
-    for (ud.param.delay_len..Userdata.DELAY_MAX_LEN) |i| {
-        ud.dbuf[i] = 0;
+        outbuf[si] = BP * ud.param.bp + HP * ud.param.hp + LP * ud.param.lp;
     }
 
     return 0;
@@ -109,7 +102,7 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.detectLeaks();
     const alloc = gpa.allocator();
-    const client_name = "delay";
+    const client_name = "filter";
 
     //var xosh = std.rand.DefaultPrng.init(0);
     //const rand = xosh.random();
@@ -134,7 +127,7 @@ pub fn main() !void {
     _ = c.jack_set_process_callback(client, process, &userdata);
     _ = c.jack_activate(client);
     _ = c.jack_connect(client, c.jack_port_name(userdata.output_port), "REAPER:in1");
-    _ = c.jack_connect(client, "sinegen:output", c.jack_port_name(userdata.input));
+    _ = c.jack_connect(client, "REAPER:out3", c.jack_port_name(userdata.input));
 
     const do_gui = true;
     if (do_gui) {
@@ -175,11 +168,6 @@ pub fn main() !void {
                     os9gui.sliderEx(&params.lp, -1, 1, "lp {d:.2}", .{params.lp});
                     os9gui.sliderEx(&params.bp, -1, 1, "bp {d:.2}", .{params.bp});
                     os9gui.sliderEx(&params.hp, -1, 1, "hp {d:.2}", .{params.hp});
-                    os9gui.hr();
-                    os9gui.sliderEx(&params.delay_len, 48000 / 1000, Userdata.DELAY_MAX_LEN, "delay len {d:.2}", .{params.delay_len});
-                    os9gui.sliderEx(&params.feedback, 0, 1, "feedback {d:.2}", .{params.feedback});
-                    os9gui.sliderEx(&params.wet, 0, 1, "wet {d:.2}", .{params.feedback});
-                    os9gui.sliderEx(&params.dry, 0, 1, "dry {d:.2}", .{params.feedback});
                     try os9gui.radio(&params.kind);
                 }
             }

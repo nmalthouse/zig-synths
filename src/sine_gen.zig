@@ -6,7 +6,7 @@ const c = @cImport({
     @cInclude("fftw3.h");
 });
 const Os9Gui = graph.gui_app.Os9Gui;
-const NUM_OSC = 32;
+const NUM_OSC = 16;
 
 fn ms(s: f32) f32 {
     return s / 1000;
@@ -16,17 +16,22 @@ var param_mutex = std.Thread.Mutex{};
 const Param = struct {
     spread: f32 = 0,
     phase: f32 = 0,
+    octave: i32 = 0,
     freq: f32 = 440,
     amp: f32 = 0.2,
     fc: f32 = 5000,
+    R: f32 = 1,
 
     m_adsr: Envelope = .{},
+    f_adsr: Envelope = .{},
 
     wave1: Osc.Waveform = .w_saw,
 };
 var params: Param = .{};
 pub const Userdata = struct {
     const fm = 5; //fm *  jack buf_size = fft_bufsize
+
+    param: Param = .{},
 
     midi_in: *c.jack_port_t,
     output_port: *c.jack_port_t,
@@ -40,6 +45,8 @@ pub const Userdata = struct {
     oscs: [NUM_OSC]Osc = [_]Osc{.{}} ** NUM_OSC,
 
     prev: f32 = 0,
+
+    R: f32 = 1,
 };
 
 //Linear adsr
@@ -123,6 +130,9 @@ pub const Osc = struct {
     wave: Waveform = .w_saw,
 
     adsr: Envelope = .{},
+    filter_adsr: Envelope = .{},
+
+    filter_state: [2]f32 = undefined,
 };
 
 pub const Voice = struct {
@@ -185,8 +195,10 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
 
     if (param_mutex.tryLock()) {
         defer param_mutex.unlock();
+        ud.param = params;
         ud.spread = params.spread;
         ud.fc = params.fc;
+        ud.R = params.R;
         ud.amp = params.amp;
         for (&ud.oscs) |*osc| {
             osc.wave = params.wave1;
@@ -194,10 +206,22 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
             osc.adsr.d = params.m_adsr.d;
             osc.adsr.s = params.m_adsr.s;
             osc.adsr.r = params.m_adsr.r;
+
+            osc.filter_adsr.a = params.f_adsr.a;
+            osc.filter_adsr.d = params.f_adsr.d;
+            osc.filter_adsr.s = params.f_adsr.s;
+            osc.filter_adsr.r = params.f_adsr.r;
         }
     }
 
-    const alpha = std.math.tau * dt * ud.fc / (std.math.tau * dt * ud.fc + 1);
+    //const alpha = std.math.tau * dt * ud.fc / (std.math.tau * dt * ud.fc + 1);
+
+    //const G = g / (g + 1);
+
+    //const w1: f32 = 200 * std.math.tau;
+    //const w2: f32 = 200 * std.math.tau;
+    const R = ud.R;
+    //const R = (w1 + w2) / (2 * @sqrt(w1 * w2));
 
     for (0..nframes) |si| {
         while (mid_event != null and mid_event.?.time >= si) {
@@ -216,6 +240,7 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
                             for (&ud.oscs) |*osc| {
                                 if (osc.note == me.buffer[1]) {
                                     osc.adsr.untrigger();
+                                    osc.filter_adsr.untrigger();
                                 }
                             }
                         },
@@ -223,9 +248,14 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
                             for (&ud.oscs) |*osc| {
                                 if (osc.adsr.state == .off) {
                                     osc.adsr.trigger();
+                                    osc.filter_adsr.trigger();
                                     osc.note = me.buffer[1];
                                     osc.vel = 128.0 / @as(f32, @floatFromInt(me.buffer[2]));
-                                    osc.pitch = 440.0 * std.math.pow(f32, 2, (@as(f32, @floatFromInt(osc.note)) - 69) / 12);
+                                    osc.pitch = 440.0 * std.math.pow(
+                                        f32,
+                                        2,
+                                        (@as(f32, @floatFromInt(osc.note)) - 69 + @as(f32, @floatFromInt(12 * ud.param.octave))) / 12,
+                                    );
                                     for (&osc.voices, 0..) |*v, i| {
                                         //v.freq = osc.pitch + spread * @as(f32, @floatFromInt(i)) * (440 / osc.pitch);
 
@@ -254,8 +284,23 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
                 for (&osc.voices) |*v| {
                     va += v.getSample(dt, osc.wave);
                 }
+                const g = ud.fc * std.math.tau * dt / 2 * osc.filter_adsr.getAmp(dt);
+                const g1 = 2 * R + g;
+                const d = 1 / (1 + 2 * R * g + std.math.pow(f32, g, 2));
+                const x = amp * va / osc.voices.len;
+                const s1 = &osc.filter_state[0];
+                const s2 = &osc.filter_state[1];
+                const HP = (x - g1 * s1.* - s2.*) * d;
+                const v1 = g * HP;
+                const BP = v1 + s1.*;
+                s1.* = BP + v1;
+                const v2 = g * BP;
+                const LP = v2 + s2.*;
+                s2.* = LP + v2;
+                out += LP;
+                //Pass through this oscs filter
 
-                out += amp * va / osc.voices.len;
+                //out += amp * va / osc.voices.len;
                 //out = out / osc.voices.len;
             }
         }
@@ -263,10 +308,11 @@ pub export fn process(nframes: c.jack_nframes_t, arg: ?*anyopaque) c_int {
         //alpha = tau *dt * fc / (tau dt fc + 1)
         //y[i] = y[i-1] + alpha * (out - y[i-1])
         dbgbuf[si] = out;
-        outbuf[si] = (ud.prev + alpha * (out - ud.prev));
+        outbuf[si] = out;
+        //outbuf[si] = (ud.prev + alpha * (out - ud.prev));
 
         //outbuf[si] = beta * ud.prev + (1 - beta) * out;
-        ud.prev = outbuf[si];
+        //ud.prev = outbuf[si];
     }
 
     return 0;
@@ -308,7 +354,8 @@ pub fn main() !void {
     };
     _ = c.jack_set_process_callback(client, process, &userdata);
 
-    _ = c.jack_connect(client, c.jack_port_name(userdata.output_port), "REAPER:in1");
+    //_ = c.jack_connect(client, c.jack_port_name(userdata.output_port), "REAPER:in1");
+    _ = c.jack_connect(client, c.jack_port_name(userdata.output_port), "delay:input");
     _ = c.jack_connect(client, c.jack_port_name(userdata.debug_port), "REAPER:in2");
     _ = c.jack_connect(client, "REAPER:MIDI Output 3", c.jack_port_name(userdata.midi_in));
 
@@ -345,18 +392,27 @@ pub fn main() !void {
                 _ = os9gui.button("hello");
 
                 {
+                    const b = 0.01;
                     param_mutex.lock();
                     defer param_mutex.unlock();
-                    os9gui.sliderEx(&params.spread, 0, 1, "spread {d:.2}", .{params.spread * 100});
+                    os9gui.sliderLog(&params.spread, 0, 1, "spread {d:.2}", .{params.spread * 100}, b);
                     os9gui.sliderEx(&params.amp, 0, 0.5, "amp {d:.2}", .{params.amp});
+                    os9gui.sliderEx(&params.octave, -3, 3, "oct {d}", .{params.octave});
                     os9gui.hr();
 
-                    os9gui.sliderEx(&params.m_adsr.a, 0.005, 15, "att {d:.2}", .{params.m_adsr.a * 1000});
-                    os9gui.sliderEx(&params.m_adsr.d, 0.005, 15, "dec {d:.2}", .{params.m_adsr.d * 1000});
+                    os9gui.sliderLog(&params.m_adsr.a, 0.005, 15, "att {d:.2}", .{params.m_adsr.a * 1000}, b);
+                    os9gui.sliderLog(&params.m_adsr.d, 0.005, 15, "dec {d:.2}", .{params.m_adsr.d * 1000}, b);
                     os9gui.sliderEx(&params.m_adsr.s, 0.0, 1, "sus {d:.2}", .{params.m_adsr.s});
-                    os9gui.sliderEx(&params.m_adsr.r, 0.005, 15, "rel {d:.2}", .{params.m_adsr.r * 1000});
+                    os9gui.sliderLog(&params.m_adsr.r, 0.005, 15, "rel {d:.2}", .{params.m_adsr.r * 1000}, b);
+                    os9gui.hr();
+                    os9gui.label("Filter: ", .{});
+                    os9gui.sliderLog(&params.f_adsr.a, 0.005, 15, "att {d:.2}", .{params.f_adsr.a * 1000}, b);
+                    os9gui.sliderLog(&params.f_adsr.d, 0.005, 15, "dec {d:.2}", .{params.f_adsr.d * 1000}, b);
+                    os9gui.sliderEx(&params.f_adsr.s, 0.0, 1, "sus {d:.2}", .{params.f_adsr.s});
+                    os9gui.sliderLog(&params.f_adsr.r, 0.005, 15, "rel {d:.2}", .{params.f_adsr.r * 1000}, b);
                     os9gui.hr();
                     os9gui.sliderEx(&params.fc, 100, 18000, "fc {d:.2}", .{params.fc});
+                    os9gui.sliderEx(&params.R, 0, 1, "R {d:.2}", .{params.R});
                     try os9gui.radio(&params.wave1);
                 }
             }
