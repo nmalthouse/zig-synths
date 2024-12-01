@@ -5,6 +5,8 @@ const c = @cImport({
     @cInclude("clap/clap.h");
 });
 const Os9Gui = graph.gui_app.Os9Gui;
+//Todo proper adsr on key release
+//Updating params in real time
 
 fn ms(s: f32) f32 {
     return s / 1000;
@@ -31,9 +33,11 @@ pub const Plugin = struct {
         min: f32 = 0,
         max: f32 = 1,
         default: f32 = 1,
+        flag: u32 = 0,
+        enum_names: ?[]const []const u8 = null,
     };
     const PARAMS = [_]ParamOutline{
-        .{ .name = "octave", .max = 3, .min = -3 },
+        .{ .name = "octave", .max = 3, .min = -3, .flag = c.CLAP_PARAM_IS_STEPPED },
         .{ .name = "spread", .default = 0 },
         .{ .name = "resonance" },
         .{ .name = "frequency", .max = 20000, .default = 18000 },
@@ -46,6 +50,14 @@ pub const Plugin = struct {
         .{ .name = "fd", .default = 0.5, .min = 0.005, .max = 15 },
         .{ .name = "fs", .default = 0.5, .min = 0, .max = 1 },
         .{ .name = "fr", .default = 0.5, .min = 0.005, .max = 15 },
+        .{
+            .name = "wave",
+            .default = 0,
+            .max = @typeInfo(sg.Osc.Waveform).Enum.fields.len - 1,
+            .min = 0,
+            .flag = c.CLAP_PARAM_IS_STEPPED | c.CLAP_PARAM_IS_ENUM,
+            .enum_names = &[@typeInfo(sg.Osc.Waveform).Enum.fields.len][]const u8{ "sin", "saw", "square" },
+        },
     };
     pub const param_ids = blk: {
         var enum_fields: [PARAMS.len]std.builtin.Type.EnumField = undefined;
@@ -143,6 +155,7 @@ pub const Plugin = struct {
                         for (&self.oscs) |*osc| {
                             if (osc.adsr.state == .off) {
                                 std.debug.print("turning note on\n", .{});
+                                //move some of these settings somewhere else
                                 osc.adsr.a = self.getParam(.a);
                                 osc.adsr.d = self.getParam(.d);
                                 osc.adsr.s = self.getParam(.s);
@@ -153,6 +166,7 @@ pub const Plugin = struct {
                                 osc.filter_adsr.r = self.getParam(.fr);
                                 osc.adsr.trigger();
                                 osc.filter_adsr.trigger();
+                                osc.wave = @enumFromInt(@as(usize, @intFromFloat(self.getParam(.wave))));
                                 osc.note = @intCast(note_event.key);
                                 osc.noteID = note_event.note_id;
                                 osc.vel = @floatCast(note_event.velocity);
@@ -197,7 +211,7 @@ pub const Extension = struct {
         const in = info.?;
         in.* = std.mem.zeroes(c.clap_param_info_t);
         in.id = index;
-        in.flags = 0;
+        in.flags = inf.flag;
         in.min_value = inf.min;
         in.max_value = inf.max;
         in.default_value = inf.default;
@@ -218,20 +232,39 @@ pub const Extension = struct {
     }
 
     export fn ext_value_to_text(_: PT, id: c.clap_id, value: f64, display: [*c]u8, len: u32) bool {
+        if (id >= Plugin.PARAMCOUNT)
+            return false;
         var fbs = std.io.FixedBufferStream([]u8){ .pos = 0, .buffer = &stringbuff };
-        fbs.writer().print("{d:.2}", .{value}) catch return false;
+
+        if (Plugin.PARAMS[id].enum_names) |en| {
+            fbs.writer().print("{s}", .{en[@intFromFloat(@trunc(value))]}) catch return false;
+        } else {
+            fbs.writer().print("{d:.2}", .{value}) catch return false;
+        }
+
         const slice = fbs.getWritten();
         const slen = @min(slice.len, len);
         @memcpy(display[0..slen], slice[0..slen]);
         display[slen] = 0;
-        _ = id;
         return true;
     }
 
-    export fn ext_text_to_value(_: PT, _: c.clap_id, value_text: [*c]const u8, out: [*c]f64) bool {
-        out[0] = std.fmt.parseFloat(f64, std.mem.span(value_text)) catch return false;
-
-        return true;
+    export fn ext_text_to_value(_: PT, id: c.clap_id, value_text: [*c]const u8, out: [*c]f64) bool {
+        if (id >= Plugin.PARAMCOUNT)
+            return false;
+        if (Plugin.PARAMS[id].enum_names) |en| {
+            const n = std.mem.span(value_text);
+            for (en, 0..) |name, i| {
+                if (std.mem.eql(u8, n, name)) {
+                    out[0] = @floatFromInt(i);
+                    return true;
+                }
+            }
+            return false;
+        } else {
+            out[0] = std.fmt.parseFloat(f64, std.mem.span(value_text)) catch return false;
+            return true;
+        }
     }
 
     export fn ext_flush(_: PT, _: [*c]const c.clap_input_events_t, _: [*c]const c.clap_output_events_t) void {}
